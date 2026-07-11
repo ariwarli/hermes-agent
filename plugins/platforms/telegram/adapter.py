@@ -2944,6 +2944,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 max_commands = telegram_menu_max_commands()
                 menu_commands, hidden_count = telegram_menu_commands(max_commands=max_commands)
                 bot_commands = [BotCommand(name, desc) for name, desc in menu_commands]
+                # Clear any stale command menu before registering the new one.
+                # Clients aggressively cache the slash list, so a delete followed
+                # by a fresh set is the only reliable way to shrink the menu.
+                try:
+                    await self._bot.delete_my_commands()
+                except Exception as del_err:
+                    logger.warning("[%s] delete_my_commands failed (continuing to set new menu): %s", self.name, del_err)
                 # Register for all scopes independently — Telegram picks the
                 # narrowest matching scope per chat type (forum topics fall
                 # through to AllGroupChats or Default).
