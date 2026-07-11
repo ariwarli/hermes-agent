@@ -424,6 +424,114 @@ _UPDATER_STOP_TIMEOUT = 15.0
 _UPDATER_START_TIMEOUT = 30.0
 
 
+def _find_ptb_internal_task(obj, mangled_name: str, qualname_substr: str):
+    """Locate a PTB-internal asyncio.Task by name-mangled attribute, falling
+    back to scanning ``asyncio.all_tasks()`` by coroutine qualname if the
+    attribute lookup misses (e.g. the attribute name changed in a newer PTB
+    version). Returns ``(task_or_none, method)`` where ``method`` describes
+    how it was found, for diagnostic logging.
+    """
+    task = getattr(obj, mangled_name, None) if obj is not None else None
+    if task is not None:
+        return task, "attribute"
+    for t in asyncio.all_tasks():
+        try:
+            if qualname_substr in t.get_coro().__qualname__:
+                return t, "task-scan-fallback"
+        except Exception:
+            continue
+    return None, "not-found"
+
+
+async def _canary_check_polling_tasks(adapter: "TelegramAdapter", delay: float = 5.0) -> None:
+    """DIAGNOSTIC (2026-07-11 incident, temporary — remove once retired).
+
+    A prior migration attempt connected to Telegram and registered the
+    command menu successfully, then silently processed zero inbound messages
+    for ~25 minutes with no exception or log line anywhere, while the
+    polling TCP connection stayed established. Root-cause investigation
+    found PTB's ``start_polling()`` only guarantees its internal
+    ``Updater.__polling_task`` (fetches from Telegram, fills update_queue)
+    and ``Application.__update_fetcher_task`` (drains update_queue, dispatches
+    to handlers) were *created* — not that they're still alive moments later.
+    ``network_retry_loop``'s ``while effective_is_running():`` can exit with
+    zero iterations and zero logging if ``Updater.running`` is already False
+    on first check, which would produce exactly the observed symptom.
+
+    This attaches a done-callback to both tasks immediately (logs any
+    exception the instant it happens) and logs a positive "still alive"
+    confirmation ``delay`` seconds later, so a repeat of this failure mode
+    is loud instead of silent.
+    """
+    app = adapter._app
+    updater = app.updater if app is not None else None
+
+    def _make_done_callback(label: str):
+        def _on_done(task: "asyncio.Task") -> None:
+            if task.cancelled():
+                logger.warning("[%s] CANARY: %s was cancelled", adapter.name, label)
+                return
+            exc = task.exception()
+            if exc is not None:
+                logger.error(
+                    "[%s] CANARY: %s died with an exception (this is the 2026-07-11 "
+                    "incident's failure mode if it recurs)",
+                    adapter.name, label, exc_info=exc,
+                )
+            else:
+                logger.error(
+                    "[%s] CANARY: %s completed with NO exception — likely exited its "
+                    "while-loop immediately (e.g. Updater.running was already False) — "
+                    "this is the silent-stall failure mode from the 2026-07-11 incident",
+                    adapter.name, label,
+                )
+        return _on_done
+
+    fetcher_task, fetcher_method = _find_ptb_internal_task(
+        app, "_Application__update_fetcher_task", "update_fetcher"
+    )
+    poller_task, poller_method = _find_ptb_internal_task(
+        updater, "_Updater__polling_task", "polling_task"
+    )
+
+    if fetcher_task is None:
+        logger.error(
+            "[%s] CANARY: could not locate update_fetcher_task by attribute or task-scan "
+            "— PTB internals may have changed shape; this check needs updating",
+            adapter.name,
+        )
+    else:
+        fetcher_task.add_done_callback(_make_done_callback(f"update_fetcher_task ({fetcher_method})"))
+
+    if poller_task is None:
+        logger.error(
+            "[%s] CANARY: could not locate polling_task by attribute or task-scan "
+            "— PTB internals may have changed shape; this check needs updating",
+            adapter.name,
+        )
+    else:
+        poller_task.add_done_callback(_make_done_callback(f"polling_task ({poller_method})"))
+
+    await asyncio.sleep(delay)
+
+    for label, task in (("update_fetcher_task", fetcher_task), ("polling_task", poller_task)):
+        if task is None:
+            continue
+        if task.done():
+            # The done-callback above already logged the details; this is
+            # just a redundant summary in case callback registration itself
+            # raced with completion.
+            logger.error(
+                "[%s] CANARY: %s already done %.1fs after start (see prior CANARY log for details)",
+                adapter.name, label, delay,
+            )
+        else:
+            logger.info(
+                "[%s] CANARY: %s alive and running %.1fs after start — healthy",
+                adapter.name, label, delay,
+            )
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -3046,7 +3154,34 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name,
             )
             return False
-        
+
+        # DIAGNOSTIC (2026-07-11 incident, temporary — remove once retired):
+        # opt-in verbose PTB/asyncio logging for this retry's verification
+        # window only, routed to a separate short-lived file so it never
+        # mixes with gateway.log or lingers in production. Never enabled
+        # unless explicitly requested via env var.
+        if os.getenv("HERMES_VERIFY_MODE", "").strip().lower() in {"1", "true", "yes"}:
+            _hermes_home = os.getenv("HERMES_HOME", os.path.expanduser("~/.hermes"))
+            _verify_log_path = os.path.join(_hermes_home, "logs", "telegram_verify_mode.log")
+            try:
+                os.makedirs(os.path.dirname(_verify_log_path), exist_ok=True)
+                _verify_handler = logging.FileHandler(_verify_log_path)
+                _verify_handler.setLevel(logging.DEBUG)
+                _verify_handler.setFormatter(logging.Formatter(
+                    "%(asctime)s %(levelname)s %(name)s: %(message)s"
+                ))
+                for _logger_name in ("telegram", "telegram.ext", "asyncio"):
+                    _lg = logging.getLogger(_logger_name)
+                    _lg.setLevel(logging.DEBUG)
+                    _lg.addHandler(_verify_handler)
+                logger.warning(
+                    "[%s] HERMES_VERIFY_MODE active — verbose telegram/asyncio "
+                    "logs routed to %s (verification-only, remove env var after)",
+                    self.name, _verify_log_path,
+                )
+            except Exception:
+                logger.exception("[%s] HERMES_VERIFY_MODE logging setup failed", self.name)
+
         if not self.config.token:
             logger.error("[%s] No bot token configured", self.name)
             return False
@@ -3205,7 +3340,23 @@ class TelegramAdapter(BasePlatformAdapter):
             builder = builder.request(request).get_updates_request(get_updates_request)
             self._app = builder.build()
             self._bot = self._app.bot
-            
+
+            # DIAGNOSTIC (2026-07-11 incident, temporary — remove once retired):
+            # global PTB error handler. Targets a secondary hypothesis for the
+            # 2026-07-11 silent-stall incident (a handler-level exception on an
+            # inbound update, swallowed by PTB with no error handler registered).
+            # Logs chat/message id only, not content, per HERMES_REDACT_SECRETS.
+            async def _diagnostic_ptb_error_handler(update, context) -> None:
+                chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+                message_id = getattr(getattr(update, "effective_message", None), "message_id", None)
+                logger.error(
+                    "[%s] CANARY: PTB error handler fired for chat_id=%s message_id=%s "
+                    "— update was received but handling raised",
+                    self.name, chat_id, message_id,
+                    exc_info=context.error,
+                )
+            self._app.add_error_handler(_diagnostic_ptb_error_handler)
+
             # Register handlers
             self._app.add_handler(TelegramMessageHandler(
                 filters.TEXT & ~filters.COMMAND,
@@ -3388,7 +3539,24 @@ class TelegramAdapter(BasePlatformAdapter):
                         "polling will be retried in the background",
                         self.name,
                     )
-            
+                else:
+                    # DIAGNOSTIC (2026-07-11 incident, temporary): PTB's
+                    # start_polling() only guarantees the internal fetch/process
+                    # tasks were *created*, not that they are still alive a few
+                    # seconds later (e.g. network_retry_loop's `while
+                    # effective_is_running():` can exit with zero iterations and
+                    # zero logging if `self.running` is False at first check).
+                    # A prior migration attempt connected + registered the menu
+                    # successfully but silently never processed a single inbound
+                    # message afterward, with no exception/log anywhere. Canary
+                    # a few seconds after start to catch a repeat of that: if
+                    # either task is already done (with or without an
+                    # exception), log loudly — that's the smoking gun this
+                    # check exists to catch.
+                    asyncio.get_running_loop().create_task(
+                        _canary_check_polling_tasks(self, delay=5.0)
+                    )
+
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
