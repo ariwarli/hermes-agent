@@ -71,6 +71,34 @@ _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+
+def _filter_agent_init_kwargs(agent_cls, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Drop gateway-only ctor kwargs unsupported by the active AIAgent runtime.
+
+    Some deployments can temporarily run a newer gateway against an older
+    ``run_agent.AIAgent`` signature during reconciliation. Filter kwargs by the
+    live constructor signature so gateway rollouts degrade compatibly instead of
+    crashing on unexpected keyword arguments.
+    """
+    try:
+        params = inspect.signature(agent_cls.__init__).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return kwargs
+    return {key: value for key, value in kwargs.items() if key in params}
+
+
+def _make_agent(agent_cls, **kwargs):
+    """Construct ``agent_cls``, filtering kwargs via ``_filter_agent_init_kwargs``.
+
+    Thin wrapper so call sites can keep passing kwargs directly (mix of
+    explicit keywords and ``**spread`` dicts) while still getting the
+    version-skew guard above.
+    """
+    return agent_cls(**_filter_agent_init_kwargs(agent_cls, kwargs))
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -11205,7 +11233,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                             if len(_hyg_msgs) >= 4:
                                 _hyg_session_db = getattr(self._session_db, "_db", self._session_db)
-                                _hyg_agent = AIAgent(
+                                _hyg_agent = _make_agent(AIAgent,
                                     **_hyg_runtime,
                                     model=_hyg_model,
                                     max_iterations=4,
@@ -13334,7 +13362,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning("Background task vision enrichment failed: %s", e)
 
             def run_sync():
-                agent = AIAgent(
+                agent = _make_agent(AIAgent,
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
@@ -18218,7 +18246,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if agent is None:
                 # Config changed or first message — create fresh agent
-                agent = AIAgent(
+                agent = _make_agent(AIAgent,
                     model=turn_route["model"],
                     **turn_route["runtime"],
                     max_iterations=max_iterations,
