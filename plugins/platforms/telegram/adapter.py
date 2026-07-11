@@ -2004,7 +2004,16 @@ class TelegramAdapter(BasePlatformAdapter):
             # TimeoutError (OSError subclass), so the except below classifies
             # it via _looks_like_network_error and schedules background
             # recovery instead of blocking connect() indefinitely.
-            await asyncio.wait_for(
+            #
+            # Using _await_with_thread_deadline (not plain asyncio.wait_for):
+            # a wedged httpx pool can sit inside a cancellation-shielded scope
+            # that never actually observes asyncio.wait_for's cancellation, so
+            # the timeout above can fail to fire in practice (reproduced
+            # 2026-07-11 against a cold-start bot with no prior polling
+            # state). The thread-deadline helper forces the wait to resolve on
+            # wall-clock time regardless of whether the underlying task yields
+            # to cancellation.
+            await _await_with_thread_deadline(
                 self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=drop_pending_updates,
@@ -2113,8 +2122,12 @@ class TelegramAdapter(BasePlatformAdapter):
             # the reconnect ladder from stalling indefinitely and allows the
             # heartbeat loop to trigger its own recovery path.
             # Refs: NousResearch/hermes-agent#59614
+            #
+            # _await_with_thread_deadline (not asyncio.wait_for): a wedged pool
+            # can sit in a cancellation-shielded scope that never observes
+            # asyncio.wait_for's cancellation, so that timeout can fail to fire.
             try:
-                await asyncio.wait_for(
+                await _await_with_thread_deadline(
                     app.updater.start_polling(
                         allowed_updates=Update.ALL_TYPES,
                         drop_pending_updates=False,
@@ -2515,8 +2528,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 # identically (#59614). Timeout converts to RuntimeError so
                 # the except below logs a readable message and schedules the
                 # next conflict attempt instead of wedging attempt N forever.
+                #
+                # _await_with_thread_deadline (not asyncio.wait_for): a wedged
+                # pool can sit in a cancellation-shielded scope that never
+                # observes asyncio.wait_for's cancellation.
                 try:
-                    await asyncio.wait_for(
+                    await _await_with_thread_deadline(
                         app.updater.start_polling(
                             allowed_updates=Update.ALL_TYPES,
                             drop_pending_updates=False,
